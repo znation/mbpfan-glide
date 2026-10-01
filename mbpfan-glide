@@ -1,0 +1,185 @@
+#!/usr/bin/python3
+"""mbpfan-glide: fan control for Macs running Linux that ramps up fast and
+glides down slowly.
+
+Each poll it takes the CPU temperature (hottest core, lightly smoothed) and,
+if present, the GPU temperature, maps each through a linear curve to a
+fraction of the fan's range, and uses the higher of the two as the target.
+When the target rises, the fans follow at once. When it falls, the fans hold
+their speed for hold_seconds and then descend at most down_rpm_per_second,
+so brief temperature dips don't make the fan pitch wander.
+
+Run as root. --dry-run (any user) prints what it would do without writing.
+On exit the fans are handed back to the SMC's automatic control.
+"""
+import argparse
+import configparser
+import glob
+import re
+import signal
+import sys
+import time
+
+DEFAULT_CONFIG = "/etc/mbpfan-glide.conf"
+DEFAULTS = {
+    "cpu_low": 50.0,
+    "cpu_high": 70.0,
+    "gpu_low": 55.0,
+    "gpu_high": 75.0,
+    "cpu_smoothing": 0.3,
+    "poll_seconds": 1.0,
+    "hold_seconds": 30.0,
+    "down_rpm_per_second": 10.0,
+}
+GPU_DRIVERS = ("amdgpu", "radeon", "nouveau")
+MIN_WRITE_RPM = 20
+LOG_STEP_RPM = 200
+
+
+def read_int(path):
+    with open(path) as f:
+        return int(f.read().strip())
+
+
+def hwmon(names):
+    for d in sorted(glob.glob("/sys/class/hwmon/hwmon*")):
+        try:
+            with open(f"{d}/name") as f:
+                if f.read().strip() in names:
+                    return d
+        except OSError:
+            pass
+    return None
+
+
+def cpu_temp(d):
+    return max(read_int(p) for p in glob.glob(f"{d}/temp*_input")) / 1000.0
+
+
+def gpu_temp(d):
+    for label in glob.glob(f"{d}/temp*_label"):
+        with open(label) as f:
+            if f.read().strip() == "junction":
+                return read_int(label.replace("_label", "_input")) / 1000.0
+    return read_int(f"{d}/temp1_input") / 1000.0
+
+
+def curve(t, low, high):
+    return min(max((t - low) / (high - low), 0.0), 1.0)
+
+
+class Fan:
+    def __init__(self, smc, n, cfg, dry_run):
+        self.base = f"{smc}/fan{n}"
+        self.n = n
+        self.dry_run = dry_run
+        self.min = cfg.getfloat(f"min_fan{n}_speed", fallback=read_int(f"{self.base}_min"))
+        self.max = cfg.getfloat(f"max_fan{n}_speed", fallback=read_int(f"{self.base}_max"))
+        self.speed = min(max(read_int(f"{self.base}_input"), self.min), self.max)
+        self.last_high = time.monotonic()
+        self.written = None
+        self.logged = None
+
+    def write(self, name, value):
+        if not self.dry_run:
+            with open(f"{self.base}_{name}", "w") as f:
+                f.write(str(int(value)))
+
+    def update(self, frac, now, hold, down_step):
+        target = self.min + frac * (self.max - self.min)
+        if target >= self.speed:
+            self.speed = target
+            self.last_high = now
+        elif now - self.last_high >= hold:
+            self.speed = max(target, self.speed - down_step)
+        at_end = self.speed in (self.min, self.max)
+        if self.written is None or abs(self.speed - self.written) >= MIN_WRITE_RPM or (
+                at_end and self.speed != self.written):
+            self.write("output", self.speed)
+            self.written = self.speed
+
+
+def load_config(path):
+    parser = configparser.ConfigParser()
+    parser.read_dict({"general": {k: str(v) for k, v in DEFAULTS.items()}})
+    parser.read(path)
+    cfg = parser["general"]
+    for name in ("cpu", "gpu"):
+        if cfg.getfloat(f"{name}_low") >= cfg.getfloat(f"{name}_high"):
+            sys.exit(f"{path}: {name}_low must be below {name}_high")
+    return cfg
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    ap.add_argument("--config", default=DEFAULT_CONFIG)
+    ap.add_argument("--dry-run", action="store_true",
+                    help="read sensors and print decisions without touching the fans")
+    args = ap.parse_args()
+    cfg = load_config(args.config)
+
+    smcs = glob.glob("/sys/devices/platform/applesmc.*")
+    if not smcs:
+        sys.exit("applesmc not found; is the applesmc module loaded?")
+    smc = smcs[0]
+    nums = sorted(int(re.search(r"fan(\d+)_input", p).group(1))
+                  for p in glob.glob(f"{smc}/fan*_input"))
+    if not nums:
+        sys.exit(f"no fans found under {smc}")
+    fans = [Fan(smc, n, cfg, args.dry_run) for n in nums]
+
+    cpu_dir = hwmon(("coretemp",))
+    if cpu_dir is None:
+        sys.exit("coretemp sensor not found; is the coretemp module loaded?")
+    gpu_dir = hwmon(GPU_DRIVERS)
+
+    def restore(*_):
+        for fan in fans:
+            fan.write("manual", 0)
+        print("fans handed back to SMC", flush=True)
+        sys.exit(0)
+
+    signal.signal(signal.SIGTERM, restore)
+    signal.signal(signal.SIGINT, restore)
+
+    poll = cfg.getfloat("poll_seconds")
+    hold = cfg.getfloat("hold_seconds")
+    down_step = cfg.getfloat("down_rpm_per_second") * poll
+    smoothing = cfg.getfloat("cpu_smoothing")
+    cpu_low, cpu_high = cfg.getfloat("cpu_low"), cfg.getfloat("cpu_high")
+    gpu_low, gpu_high = cfg.getfloat("gpu_low"), cfg.getfloat("gpu_high")
+
+    for fan in fans:
+        fan.write("manual", 1)
+    print("started%s: %s; gpu sensor: %s" % (
+        " (dry run)" if args.dry_run else "",
+        ", ".join(f"fan{f.n} {f.min:.0f}-{f.max:.0f} rpm" for f in fans),
+        gpu_dir or "none"), flush=True)
+
+    cpu_ema = cpu_temp(cpu_dir)
+    while True:
+        now = time.monotonic()
+        try:
+            cpu_ema += smoothing * (cpu_temp(cpu_dir) - cpu_ema)
+            gpu = gpu_temp(gpu_dir) if gpu_dir else float("nan")
+            frac = curve(cpu_ema, cpu_low, cpu_high)
+            if gpu_dir:
+                frac = max(frac, curve(gpu, gpu_low, gpu_high))
+        except (OSError, ValueError) as e:
+            print(f"sensor read failed ({e}); fans to max", flush=True)
+            gpu, frac = float("nan"), 1.0
+
+        for fan in fans:
+            fan.update(frac, now, hold, down_step)
+
+        if args.dry_run or any(f.logged is None or abs(f.speed - f.logged) >= LOG_STEP_RPM
+                               for f in fans):
+            print(f"cpu {cpu_ema:5.1f}C gpu {gpu:5.1f}C target {frac:4.0%} " +
+                  " ".join(f"fan{f.n} {f.speed:4.0f}" for f in fans), flush=True)
+            for f in fans:
+                f.logged = f.speed
+        time.sleep(poll)
+
+
+if __name__ == "__main__":
+    main()

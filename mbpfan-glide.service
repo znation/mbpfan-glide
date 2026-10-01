@@ -1,0 +1,13 @@
+[Unit]
+Description=mbpfan-glide fan control (fast ramp up, slow ramp down)
+After=systemd-modules-load.service
+Conflicts=mbpfan.service
+
+[Service]
+ExecStart=/usr/local/bin/mbpfan-glide
+ExecStopPost=/bin/sh -c 'for f in /sys/devices/platform/applesmc.*/fan*_manual; do echo 0 > "$f"; done'
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
