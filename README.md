@@ -17,7 +17,7 @@ Every `poll_seconds`:
 3. If the target is above the current speed, jump to it.
 4. If it is below, hold the current speed for `hold_seconds`, then descend at most `down_rpm_per_second` toward it.
 
-Fan limits come from the SMC (`fanN_min`, `fanN_max`), and every fan the SMC exposes is controlled, so machines with one fan or several work the same way. On exit the fans are handed back to the SMC's automatic control.
+Fan limits come from the SMC (`fanN_min`, `fanN_max`), and every fan the SMC exposes is controlled, so machines with one fan or several work the same way. The SMC can also take a fan back into automatic control on its own — it does across sleep/wake — which silently voids the `fanN_output` writes; every poll the daemon re-checks `fanN_manual` and reclaims the fan if needed. On exit the fans are handed back to the SMC's automatic control.
 
 On the same two-minute iMac recording, mbpfan-glide changed speed once.
 

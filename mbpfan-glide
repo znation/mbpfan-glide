@@ -7,7 +7,9 @@ if present, the GPU temperature, maps each through a linear curve to a
 fraction of the fan's range, and uses the higher of the two as the target.
 When the target rises, the fans follow at once. When it falls, the fans hold
 their speed for hold_seconds and then descend at most down_rpm_per_second,
-so brief temperature dips don't make the fan pitch wander.
+so brief temperature dips don't make the fan pitch wander. The SMC can take a
+fan back into automatic control on its own (it does across sleep/wake), which
+would leave fanN_output ignored, so each poll the fans are reclaimed if so.
 
 Run as root. --dry-run (any user) prints what it would do without writing.
 On exit the fans are handed back to the SMC's automatic control.
@@ -85,6 +87,17 @@ class Fan:
             with open(f"{self.base}_{name}", "w") as f:
                 f.write(str(int(value)))
 
+    def claim(self):
+        """Make sure this fan is under software control, taking it back if the SMC
+        has reclaimed it (it does across sleep/wake). Returns True if it was
+        already ours."""
+        if read_int(f"{self.base}_manual") == 1:
+            return True
+        if not self.dry_run:
+            self.write("manual", 1)
+            self.written = None  # the SMC's target stands until we write ours
+        return False
+
     def update(self, frac, now, hold, down_step):
         target = self.min + frac * (self.max - self.min)
         if target >= self.speed:
@@ -150,7 +163,7 @@ def main():
     gpu_low, gpu_high = cfg.getfloat("gpu_low"), cfg.getfloat("gpu_high")
 
     for fan in fans:
-        fan.write("manual", 1)
+        fan.claim()
     print("started%s: %s; gpu sensor: %s" % (
         " (dry run)" if args.dry_run else "",
         ", ".join(f"fan{f.n} {f.min:.0f}-{f.max:.0f} rpm" for f in fans),
@@ -170,6 +183,9 @@ def main():
             gpu, frac = float("nan"), 1.0
 
         for fan in fans:
+            if not fan.claim() and not args.dry_run:
+                print(f"fan{fan.n}: SMC had taken back manual control; reclaimed",
+                      flush=True)
             fan.update(frac, now, hold, down_step)
 
         if args.dry_run or any(f.logged is None or abs(f.speed - f.logged) >= LOG_STEP_RPM
